@@ -1,0 +1,49 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Python environments, caches and build artifacts
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local application data and test artifacts
+backend/.pytest_tmp/
+backend/data/
+coverage/
+*.tsbuildinfo
+
+# JavaScript dependencies and tooling caches
+node_modules/
+npm_modules/
+npm_module/
+.npm/
+.vite/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local debugging screenshots
+/resume_before.png
+/resume_after.png
+/resume_compact.png
+/tmp_resume_*.png
