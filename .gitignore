@@ -29,6 +29,8 @@ output/
 # Local application data and test artifacts
 backend/.pytest_tmp/
 backend/data/
+backend/tests/
+frontend/tests/
 coverage/
 *.tsbuildinfo
 
