@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from app.agents.scheme_agent import MAX_GENERATION_RETRIES, SchemeAgent
 from app.agents.scheme_state import ProjectAgentContext, RetrievedKnowledgeItem
@@ -16,7 +17,7 @@ from app.schemas.scheme import (
     RetrievalPlan,
     SchemeGenerateRequest,
 )
-from app.services.scheme_validation import SchemeValidator
+from app.services.scheme_validation import SchemeValidator, schemes_are_diverse
 from app.services.schemes import SchemeService
 
 
@@ -133,9 +134,7 @@ def make_agent(chat: FakeChatProvider) -> WorkflowAgent:
 @pytest.mark.asyncio
 async def test_agent_feedback_retry_then_succeeds_and_builds_trace() -> None:
     too_similar = CandidateSet(
-        candidates=[
-            candidate(f"相似方案{index}", "同一种集中式联合优化路线") for index in range(3)
-        ]
+        candidates=[candidate(f"相似方案{index}", "同一种集中式联合优化路线") for index in range(3)]
     )
     diverse = CandidateSet(
         candidates=[
@@ -210,9 +209,7 @@ async def test_knowledge_tool_scopes_vector_search_and_type_to_project_papers() 
             return [paper_id]
 
     class VectorStore:
-        async def search_knowledge(
-            self, query, allowed_paper_ids, top_k=8, knowledge_type=None
-        ):
+        async def search_knowledge(self, query, allowed_paper_ids, top_k=8, knowledge_type=None):
             assert (query, allowed_paper_ids, top_k, knowledge_type) == (
                 "latency",
                 [str(paper_id)],
@@ -222,11 +219,15 @@ async def test_knowledge_tool_scopes_vector_search_and_type_to_project_papers() 
             return {
                 "ids": [["version:algorithm:0"]],
                 "documents": [["降低时延"]],
-                "metadatas": [[{
-                    "paper_id": str(paper_id),
-                    "knowledge_type": "algorithm",
-                    "name": "Actor critic",
-                }]],
+                "metadatas": [
+                    [
+                        {
+                            "paper_id": str(paper_id),
+                            "knowledge_type": "algorithm",
+                            "name": "Actor critic",
+                        }
+                    ]
+                ],
                 "distances": [[0.1]],
             }
 
@@ -246,3 +247,57 @@ def test_revision_version_conflict_is_preserved() -> None:
 
 def test_retry_limit_is_one() -> None:
     assert MAX_GENERATION_RETRIES == 1
+
+
+def test_different_names_do_not_mask_identical_research_routes():
+    candidates = [candidate(letter * 450, "DAG offloading") for letter in "ABC"]
+    assert not schemes_are_diverse(candidates)
+
+
+def test_retrieval_plan_rejects_blank_queries_and_normalizes_duplicates():
+    with pytest.raises(ValidationError):
+        RetrievalPlan(scenario_queries=[" "], algorithm_queries=["MEC"])
+    plan = RetrievalPlan(
+        scenario_queries=[" MEC ", "MEC"],
+        algorithm_queries=[" DAG offloading "],
+    )
+    assert plan.scenario_queries == ["MEC"]
+    assert plan.algorithm_queries == ["DAG offloading"]
+
+
+async def test_offloading_goal_and_hard_constraints_reach_generation_and_validation():
+    chat = FakeChatProvider(
+        [
+            RetrievalPlan(
+                scenario_queries=["DAG offloading"], algorithm_queries=["queue scheduling"]
+            ),
+            CandidateSet(
+                candidates=[
+                    candidate("分布式", "博弈"),
+                    candidate("分层", "强化学习"),
+                    candidate("预测", "启发算法"),
+                ]
+            ),
+            checks(),
+        ]
+    )
+    agent = make_agent(chat)
+    goal = "降低 DAG 计算卸载时延，不得使用云端执行"
+    state = await agent._build_graph().ainvoke(
+        {
+            "project_id": str(agent.project_id),
+            "agent_run_id": str(uuid.uuid4()),
+            "thread_id": agent.thread_id,
+            "goal": goal,
+            "selected_idea_ids": [],
+            "retry_count": 0,
+            "steps": [],
+        },
+        config={"configurable": {"thread_id": agent.thread_id}},
+    )
+    assert len(state["candidate_ids"]) == 3
+    for messages in chat.messages:
+        assert goal in messages[1]["content"]
+        assert "不得使用云端执行" in messages[1]["content"]
+        assert "计算卸载研究的条件性补充规则" in messages[0]["content"]
+    assert len(agent.prompt_version) <= 64

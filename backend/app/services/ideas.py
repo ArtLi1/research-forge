@@ -39,12 +39,13 @@ class IdeaService:
             **data.model_dump(mode="json"),
         )
         self.session.add(idea)
-        await self.session.commit()
-        await self.session.refresh(idea)
+        await self.session.flush()
         if idea.status == "adopted":
             await ProjectKnowledgeService(self.session).add_adopted_idea(
-                project_id, idea.id, idea.content
+                project_id, idea.id, idea.content, commit=False
             )
+        await self.session.commit()
+        await self.session.refresh(idea)
         return idea
 
     async def update(self, idea_id: uuid.UUID, data: UserIdeaUpdate) -> UserIdea:
@@ -52,12 +53,12 @@ class IdeaService:
         old_status = idea.status
         for key, value in data.model_dump(exclude_unset=True, mode="json").items():
             setattr(idea, key, value)
-        await self.session.commit()
-        await self.session.refresh(idea)
         if old_status != "adopted" and idea.status == "adopted":
             await ProjectKnowledgeService(self.session).add_adopted_idea(
-                idea.project_id, idea.id, idea.content
+                idea.project_id, idea.id, idea.content, commit=False
             )
+        await self.session.commit()
+        await self.session.refresh(idea)
         return idea
 
     async def delete(self, idea_id: uuid.UUID) -> None:
@@ -79,7 +80,10 @@ class IdeaService:
         provider = OpenAICompatibleChatProvider()
         evaluation = await provider.generate_structured(
             [
-                {"role": "system", "content": load_prompt("evaluate_idea_v1.md")},
+                {
+                    "role": "system",
+                    "content": load_prompt("evaluate_idea_v1.md", offloading_guidance=True),
+                },
                 {
                     "role": "user",
                     "content": (

@@ -3,13 +3,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from redis import Redis
-from rq import Queue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.scheme_tools import build_default_scheme_tools
-from app.core.config import get_settings
 from app.core.errors import AppError, not_found
 from app.models import (
     AgentRun,
@@ -37,10 +34,11 @@ from app.services.project_knowledge import ProjectKnowledgeService
 from app.services.scheme_validation import (
     build_risk_assessment,
 )
+from app.services.tasks import TaskService
 
 
 class SchemeService:
-    revision_prompt_version = "revise_scheme_v1"
+    revision_prompt_version = "revise_scheme_v1+offloading_research_guidance_v1"
 
     def __init__(self, session: AsyncSession, *, chat: ChatModelProvider | None = None) -> None:
         self.session = session
@@ -76,7 +74,12 @@ class SchemeService:
         )
         self.session.add(task)
         await self.session.commit()
-        await self._enqueue(task)
+        await TaskService(self.session).enqueue(
+            task,
+            job_path="app.tasks.scheme_generation.generate_schemes_job",
+            job_timeout=3600,
+            extra_args=(task.payload,),
+        )
         return task
 
     async def list(self, project_id: uuid.UUID) -> list[CandidateSchemeSummary]:
@@ -89,7 +92,25 @@ class SchemeService:
                 .order_by(CandidateScheme.created_at.desc())
             )
         )
-        return [await self._summary(item) for item in schemes]
+        if not schemes:
+            return []
+        versions = list(
+            await self.session.scalars(
+                select(CandidateVersion).where(
+                    CandidateVersion.id.in_([item.current_version_id for item in schemes])
+                )
+            )
+        )
+        version_map = {item.id: item for item in versions}
+        return [
+            self._summary(
+                item,
+                self._require_version(
+                    version_map.get(item.current_version_id) if item.current_version_id else None
+                ),
+            )
+            for item in schemes
+        ]
 
     async def get(self, scheme_id: uuid.UUID) -> CandidateSchemeDetail:
         scheme = await self.session.get(CandidateScheme, scheme_id)
@@ -102,7 +123,8 @@ class SchemeService:
                 .order_by(CandidateVersion.version_number.desc())
             )
         )
-        summary = await self._summary(scheme)
+        current = next((item for item in versions if item.id == scheme.current_version_id), None)
+        summary = self._summary(scheme, self._require_version(current))
         return CandidateSchemeDetail(
             **summary.model_dump(),
             versions=[self._version_read(item) for item in versions],
@@ -129,7 +151,7 @@ class SchemeService:
             [
                 {
                     "role": "system",
-                    "content": load_prompt("revise_scheme_v1.md"),
+                    "content": load_prompt("revise_scheme_v1.md", offloading_guidance=True),
                 },
                 {
                     "role": "user",
@@ -153,7 +175,9 @@ class SchemeService:
             [
                 {
                     "role": "system",
-                    "content": load_prompt("check_single_scheme_constraints_v1.md"),
+                    "content": load_prompt(
+                        "check_single_scheme_constraints_v1.md", offloading_guidance=True
+                    ),
                 },
                 {
                     "role": "user",
@@ -219,7 +243,10 @@ class SchemeService:
         self, scheme_id: uuid.UUID, request: SchemeAcceptRequest
     ) -> CandidateSchemeDetail:
         scheme = await self.session.scalar(
-            select(CandidateScheme).where(CandidateScheme.id == scheme_id).with_for_update()
+            select(CandidateScheme)
+            .where(CandidateScheme.id == scheme_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if scheme is None:
             raise not_found("scheme", scheme_id)
@@ -341,7 +368,10 @@ class SchemeService:
 
     async def _locked_candidate(self, scheme_id: uuid.UUID) -> CandidateScheme:
         scheme = await self.session.scalar(
-            select(CandidateScheme).where(CandidateScheme.id == scheme_id).with_for_update()
+            select(CandidateScheme)
+            .where(CandidateScheme.id == scheme_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if scheme is None:
             raise not_found("scheme", scheme_id)
@@ -357,6 +387,10 @@ class SchemeService:
         if scheme.current_version_id is None:
             raise AppError("SCHEME_VERSION_CONFLICT", "候选方案没有当前版本", status_code=409)
         version = await self.session.get(CandidateVersion, scheme.current_version_id)
+        return self._require_version(version)
+
+    @staticmethod
+    def _require_version(version: CandidateVersion | None) -> CandidateVersion:
         if version is None:
             raise AppError("SCHEME_VERSION_CONFLICT", "候选方案当前版本不存在", status_code=409)
         return version
@@ -371,9 +405,7 @@ class SchemeService:
                 details={"current_version_id": str(version.id)},
             )
 
-    async def _revision_context(
-        self, project_id: uuid.UUID, query: str
-    ) -> dict[str, Any]:
+    async def _revision_context(self, project_id: uuid.UUID, query: str) -> dict[str, Any]:
         tools = build_default_scheme_tools(self.session)
         project = await tools.project_context.run(project_id)
         scenarios = await tools.knowledge_search.run(project_id, query, "scenario", limit=10)
@@ -384,8 +416,9 @@ class SchemeService:
             "algorithm_knowledge": [item.model_dump(mode="json") for item in algorithms],
         }
 
-    async def _summary(self, scheme: CandidateScheme) -> CandidateSchemeSummary:
-        version = await self._current_version(scheme)
+    def _summary(
+        self, scheme: CandidateScheme, version: CandidateVersion
+    ) -> CandidateSchemeSummary:
         return CandidateSchemeSummary(
             id=scheme.id,
             project_id=scheme.project_id,
@@ -414,33 +447,3 @@ class SchemeService:
             prompt_version=version.prompt_version,
             created_at=version.created_at,
         )
-
-    async def _enqueue(self, task: BackgroundTask) -> None:
-        settings = get_settings()
-        try:
-            queue = Queue(
-                "scheme_generate",
-                connection=Redis.from_url(settings.redis_url),
-                default_timeout=3600,
-            )
-            job = queue.enqueue(
-                "app.tasks.scheme_generation.generate_schemes_job",
-                str(task.resource_id),
-                str(task.id),
-                task.payload,
-                job_timeout=3600,
-            )
-            task.rq_job_id = job.id
-            await self.session.commit()
-        except Exception as exc:
-            task.status = "failed"
-            task.stage = "enqueue_failed"
-            task.message = "候选方案任务提交失败"
-            task.error = str(exc)
-            await self.session.commit()
-            raise AppError(
-                "TASK_QUEUE_ERROR",
-                "候选方案任务提交失败",
-                status_code=502,
-                details={"reason": str(exc)},
-            ) from exc

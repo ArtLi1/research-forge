@@ -15,11 +15,10 @@ CAPTION_RE = re.compile(r"^(fig(?:ure)?|table)\s*[.\d:]", re.IGNORECASE)
 class PdfParser:
     def parse(self, path: Path) -> ParsedDocument:
         try:
-            document = pymupdf.open(path)
-            if document.page_count == 0:
-                raise ValueError("PDF 没有页面")
-            metadata = dict(document.metadata or {})
-            document.close()
+            with pymupdf.open(path) as document:
+                if document.page_count == 0:
+                    raise ValueError("PDF 没有页面")
+                metadata = dict(document.metadata or {})
             pages = cast(
                 list[dict[str, Any]],
                 pymupdf4llm.to_markdown(

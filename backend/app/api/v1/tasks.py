@@ -12,7 +12,7 @@ from app.schemas.scheme import SchemeGenerateRequest
 from app.schemas.task import TaskRead
 from app.services.papers import PaperService
 from app.services.schemes import SchemeService
-from app.services.tasks import TaskService
+from app.services.tasks import TERMINAL_TASK_STATUSES, TaskService, task_event_name
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -24,6 +24,10 @@ async def get_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_sessi
 
 @router.get("/{task_id}/events")
 async def task_events(task_id: uuid.UUID, request: Request) -> StreamingResponse:
+    # Validate before streaming headers are sent so missing tasks return a normal 404.
+    async with SessionLocal() as session:
+        await TaskService(session).get(task_id)
+
     async def event_stream() -> AsyncIterator[str]:
         last_payload = ""
         while not await request.is_disconnected():
@@ -31,16 +35,12 @@ async def task_events(task_id: uuid.UUID, request: Request) -> StreamingResponse
                 task = await TaskService(session).get(task_id)
                 payload = TaskRead.model_validate(task).model_dump_json()
             if payload != last_payload:
-                event = (
-                    "completed"
-                    if task.status in {"succeeded", "partial"}
-                    else "failed"
-                    if task.status == "failed"
-                    else "progress"
-                )
+                event = task_event_name(task.status)
                 yield f"event: {event}\ndata: {payload}\n\n"
                 last_payload = payload
-            if task.status in {"succeeded", "partial", "failed", "cancelled"}:
+            else:
+                yield ": heartbeat\n\n"
+            if task.status in TERMINAL_TASK_STATUSES:
                 break
             await asyncio.sleep(1)
 
@@ -67,4 +67,6 @@ async def retry_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_ses
         raise AppError("TASK_NOT_RETRYABLE", "该任务当前不可重试", status_code=409)
     if task.task_type == "knowledge_extract":
         return await PaperService(session).extract(task.resource_id)
-    return await PaperService(session).reparse(task.resource_id)
+    if task.task_type == "paper_parse":
+        return await PaperService(session).reparse(task.resource_id)
+    raise AppError("TASK_NOT_RETRYABLE", "该任务类型不可重试", status_code=409)

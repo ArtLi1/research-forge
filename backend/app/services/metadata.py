@@ -36,7 +36,7 @@ def validate_metadata_value(definition: MetadataDefinition, value: Any) -> Any:
     if definition.value_type == "multi_enum" and isinstance(value, list):
         if all(isinstance(item, str) and item in (definition.options or []) for item in value):
             return value
-    if definition.value_type == "rating" and isinstance(value, (int, float)):
+    if definition.value_type == "rating" and type(value) in {int, float}:
         if 1 <= value <= 5:
             return value
     raise AppError(

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElButton, ElMessage, ElMessageBox, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
@@ -33,19 +33,19 @@ async function load() {
   ])
 }
 
-async function removePaper(paper: Paper) {
+async function removePaper(paperId: string, title: string) {
   try {
     await ElMessageBox.confirm(
-      `从当前项目移除“${paper.title}”？全局文献和知识卡不会删除。`,
+      `从当前项目移除“${title}”？全局文献和知识卡不会删除。`,
       '移除项目文献',
       { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' },
     )
   } catch {
     return
   }
-  removingPaperId.value = paper.id
+  removingPaperId.value = paperId
   try {
-    await removeProjectPaper(String(route.params.id), paper.id)
+    await removeProjectPaper(String(route.params.id), paperId)
     ElMessage.success('已从项目移除，论文仍保留在全局文献库')
     await load()
   } catch (error) {
@@ -139,7 +139,7 @@ onMounted(() => void load())
             text
             type="danger"
             :loading="removingPaperId === row.id"
-            @click="removePaper(row)"
+            @click="removePaper(row.id, row.title)"
           >
             移除
           </el-button>

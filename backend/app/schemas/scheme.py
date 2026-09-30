@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class CandidateSchemeContent(BaseModel):
@@ -56,6 +56,14 @@ class CandidateConstraintSet(BaseModel):
 class RetrievalPlan(BaseModel):
     scenario_queries: list[str] = Field(min_length=1, max_length=3)
     algorithm_queries: list[str] = Field(min_length=1, max_length=3)
+
+    @field_validator("scenario_queries", "algorithm_queries")
+    @classmethod
+    def require_usable_queries(cls, queries: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(query.strip() for query in queries if query.strip()))
+        if not normalized:
+            raise ValueError("每种知识至少需要一条非空检索词")
+        return normalized
 
 
 class SchemeValidationResult(BaseModel):

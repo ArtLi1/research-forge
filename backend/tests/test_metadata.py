@@ -42,6 +42,8 @@ def test_validate_metadata_value_accepts_supported_types(
         (_definition("single_enum", ["low", "high"]), "unknown"),
         (_definition("multi_enum", ["UAV"]), ["UAV", "MEC"]),
         (_definition("rating"), 6),
+        (_definition("rating"), True),
+        (_definition("rating"), float("nan")),
     ],
 )
 def test_validate_metadata_value_rejects_invalid_values(

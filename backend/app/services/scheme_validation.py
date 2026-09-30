@@ -15,13 +15,12 @@ def schemes_are_diverse(candidates: list[CandidateSchemeContent]) -> bool:
     signatures = [
         " | ".join(
             [
-                item.name,
                 *item.core_research_question,
                 *item.scenario_innovation,
                 *item.model_level_changes,
                 *item.algorithm_innovation,
             ]
-        )
+        ).casefold()
         for item in candidates
     ]
     return all(
@@ -74,7 +73,12 @@ class SchemeValidator:
         diversity_passed = schemes_are_diverse(candidates)
         semantic = await self.chat.generate_structured(
             [
-                {"role": "system", "content": load_prompt("check_scheme_constraints_v1.md")},
+                {
+                    "role": "system",
+                    "content": load_prompt(
+                        "check_scheme_constraints_v1.md", offloading_guidance=True
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(

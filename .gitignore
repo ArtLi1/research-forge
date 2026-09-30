@@ -1,4 +1,5 @@
 # Local configuration and secrets
+/CODE_INDEX.md
 .env
 .env.*
 !.env.example

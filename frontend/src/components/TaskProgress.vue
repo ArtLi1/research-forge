@@ -1,43 +1,24 @@
 <script setup lang="ts">
-import { ElMessage } from 'element-plus'
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { ElButton, ElMessage, ElProgress } from 'element-plus'
+import { ref } from 'vue'
 
 import { retryTask } from '@/api'
-import type { BackgroundTask } from '@/types'
+import { useTaskProgress } from '@/composables/useTaskProgress'
 
 const props = defineProps<{ taskId: string }>()
 const emit = defineEmits<{ completed: [] }>()
-const task = ref<BackgroundTask | null>(null)
-const activeTaskId = ref(props.taskId)
+const { task, activeTaskId, disconnected, followTask } = useTaskProgress(
+  () => props.taskId, () => emit('completed'),
+)
 const retrying = ref(false)
-let source: EventSource | null = null
-
-function receive(event: MessageEvent) {
-  task.value = JSON.parse(event.data) as BackgroundTask
-}
-
-function connect(taskId: string) {
-  source?.close()
-  source = new EventSource(`/api/v1/tasks/${taskId}/events`)
-  source.addEventListener('progress', receive)
-  source.addEventListener('completed', (event) => {
-    receive(event)
-    source?.close()
-    emit('completed')
-  })
-  source.addEventListener('failed', (event) => {
-    receive(event)
-    source?.close()
-  })
-}
 
 async function retry() {
   retrying.value = true
+  const retriedId = activeTaskId.value
   try {
-    const replacement = await retryTask(activeTaskId.value)
-    activeTaskId.value = replacement.id
-    task.value = replacement
-    connect(replacement.id)
+    const replacement = await retryTask(retriedId)
+    if (activeTaskId.value !== retriedId) return
+    followTask(replacement.id, replacement)
     ElMessage.success('重试任务已提交')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '任务重试失败')
@@ -46,11 +27,6 @@ async function retry() {
   }
 }
 
-onMounted(() => {
-  connect(activeTaskId.value)
-})
-
-onBeforeUnmount(() => source?.close())
 </script>
 
 <template>
@@ -65,6 +41,7 @@ onBeforeUnmount(() => source?.close())
       :show-text="false"
     />
     <p v-if="task?.error" class="error-copy">{{ task.error }}</p>
+    <p v-if="disconnected" class="error-copy">进度连接中断，正在重新连接…</p>
     <el-button
       v-if="task?.status === 'failed'"
       type="danger"

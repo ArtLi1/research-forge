@@ -3,8 +3,6 @@ import uuid
 from pathlib import Path
 
 from fastapi import UploadFile
-from redis import Redis
-from rq import Queue
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -13,6 +11,7 @@ from app.models import BackgroundTask, Paper, Project, ProjectPaper
 from app.providers.storage import LocalPaperStorage
 from app.repositories.papers import PaperRepository
 from app.schemas.paper import PaperUploadResult
+from app.services.tasks import TaskService
 
 
 def normalize_title(title: str) -> str:
@@ -148,30 +147,4 @@ class PaperService:
         job_path: str = "app.tasks.paper_processing.process_paper_job",
         job_timeout: int = 1800,
     ) -> None:
-        settings = get_settings()
-        try:
-            queue = Queue(
-                task.task_type,
-                connection=Redis.from_url(settings.redis_url),
-                default_timeout=job_timeout,
-            )
-            job = queue.enqueue(
-                job_path,
-                str(task.resource_id),
-                str(task.id),
-                job_timeout=job_timeout,
-            )
-            task.rq_job_id = job.id
-            await self.session.commit()
-        except Exception as exc:
-            task.status = "failed"
-            task.stage = "enqueue_failed"
-            task.message = "后台任务提交失败"
-            task.error = str(exc)
-            await self.session.commit()
-            raise AppError(
-                "TASK_QUEUE_ERROR",
-                "后台任务提交失败",
-                status_code=502,
-                details={"reason": str(exc)},
-            ) from exc
+        await TaskService(self.session).enqueue(task, job_path=job_path, job_timeout=job_timeout)

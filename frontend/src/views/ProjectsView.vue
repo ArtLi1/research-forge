@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElLoading, ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, reactive, ref } from 'vue'
 
 import EmptyState from '@/components/EmptyState.vue'
 import { createProject, deleteProject, getProjects } from '@/api'
 import type { Project } from '@/types'
 
+const vLoading = ElLoading.directive
 const projects = ref<Project[]>([])
 const loading = ref(false)
 const dialogOpen = ref(false)

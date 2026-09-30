@@ -112,6 +112,11 @@ class OpenAICompatibleChatProvider:
         return fenced.group(1) if fenced else text
 
 
-def load_prompt(name: str) -> str:
-    path = Path(__file__).resolve().parents[1] / "prompts" / name
-    return path.read_text(encoding="utf-8")
+def load_prompt(name: str, *, offloading_guidance: bool = False) -> str:
+    directory = Path(__file__).resolve().parents[1] / "prompts"
+    prompt = (directory / name).read_text(encoding="utf-8")
+    if offloading_guidance:
+        prompt += "\n\n" + (directory / "offloading_research_guidance_v1.md").read_text(
+            encoding="utf-8"
+        )
+    return prompt

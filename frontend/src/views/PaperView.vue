@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage } from 'element-plus'
+import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElLoading, ElMessage, ElOption, ElSelect, ElSwitch } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
@@ -16,6 +16,7 @@ import {
 import type { KnowledgeCard as KnowledgeCardType, MetadataDefinition, Paper } from '@/types'
 
 const route = useRoute()
+const vLoading = ElLoading.directive
 const paper = ref<Paper | null>(null)
 const card = ref<KnowledgeCardType | null>(null)
 const definitions = ref<MetadataDefinition[]>([])

@@ -14,6 +14,10 @@ class _Piece:
 
 class DomainAwareChunker:
     def __init__(self, target_tokens: int = 900, max_tokens: int = 1200, overlap: int = 120):
+        if not (0 < target_tokens <= max_tokens and 0 <= overlap < max_tokens):
+            raise ValueError(
+                "Require 0 < target_tokens <= max_tokens and 0 <= overlap < max_tokens"
+            )
         self.target_tokens = target_tokens
         self.max_tokens = max_tokens
         self.overlap = overlap
@@ -71,16 +75,18 @@ class DomainAwareChunker:
                 buffer = []
                 continue
             piece = _Piece(block.content, block.page, block.block_type)
-            projected = "\n\n".join([*(item.text for item in buffer), piece.text])
-            if buffer and self.token_count(projected) > self.target_tokens:
-                flush()
-                projected = "\n\n".join([*(item.text for item in buffer), piece.text])
             if self.token_count(piece.text) > self.max_tokens:
                 flush()
                 buffer = []
                 self._split_long_piece(piece, chunks, section_title, section_level)
-            else:
-                buffer.append(piece)
+                continue
+            projected = "\n\n".join([*(item.text for item in buffer), piece.text])
+            if buffer and self.token_count(projected) > self.target_tokens:
+                flush()
+                projected = "\n\n".join([*(item.text for item in buffer), piece.text])
+            if self.token_count(projected) > self.max_tokens:
+                buffer = []
+            buffer.append(piece)
         flush()
         return [chunk for chunk in chunks if chunk.content]
 

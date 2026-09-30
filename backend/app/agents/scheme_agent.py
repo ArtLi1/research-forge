@@ -31,7 +31,7 @@ MAX_KNOWLEDGE_PER_TYPE = 15
 
 
 class SchemeAgent:
-    prompt_version = "generate_schemes_v1"
+    prompt_version = "generate_schemes_v1+offloading_research_guidance_v1"
 
     def __init__(
         self,
@@ -68,6 +68,7 @@ class SchemeAgent:
         )
         self.session.add(run)
         await self.session.commit()
+        run_id = run.id
         initial: SchemeAgentState = {
             "project_id": str(self.project_id),
             "agent_run_id": str(run.id),
@@ -89,7 +90,7 @@ class SchemeAgent:
             return candidate_ids
         except Exception as exc:
             await self.session.rollback()
-            stored = await self.session.get(AgentRun, run.id)
+            stored = await self.session.get(AgentRun, run_id)
             if stored is not None:
                 stored.status = "failed"
                 stored.error = str(exc)[:4000]
@@ -132,9 +133,7 @@ class SchemeAgent:
             self.task_id, status="running", stage=stage, progress=progress, message=message
         )
 
-    def _step(
-        self, state: SchemeAgentState, name: str, **details: Any
-    ) -> list[dict[str, Any]]:
+    def _step(self, state: SchemeAgentState, name: str, **details: Any) -> list[dict[str, Any]]:
         self.trace_steps = [
             *state.get("steps", []),
             {"name": name, "status": "completed", **details},
@@ -166,7 +165,12 @@ class SchemeAgent:
         await self._progress("planning_retrieval", 23, "正在规划场景与算法知识检索")
         plan = await self.chat.generate_structured(
             [
-                {"role": "system", "content": load_prompt("plan_knowledge_retrieval_v2.md")},
+                {
+                    "role": "system",
+                    "content": load_prompt(
+                        "plan_knowledge_retrieval_v2.md", offloading_guidance=True
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -244,7 +248,10 @@ class SchemeAgent:
         )
         generated = await self.chat.generate_structured(
             [
-                {"role": "system", "content": load_prompt("generate_schemes_v1.md")},
+                {
+                    "role": "system",
+                    "content": load_prompt("generate_schemes_v1.md", offloading_guidance=True),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(

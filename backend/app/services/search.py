@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from sqlalchemy import select
@@ -37,17 +38,17 @@ class SearchService:
 
         papers = list(await self.session.scalars(statement))
         paper_map = {str(paper.id): paper for paper in papers}
+        if not paper_map:
+            return EvidencePack(
+                query=request.query,
+                items=[],
+                missing_information=["没有检索到符合范围的正文或知识"],
+            )
         store = ChromaVectorStore()
-        knowledge_result = await store.search_knowledge(
-            request.query,
-            list(paper_map),
-            min(8, request.top_k),
-        )
-        result = await store.search_chunks(
-            request.query,
-            list(paper_map),
-            request.top_k,
-            filters.chunk_types,
+        # Only vector calls run concurrently; AsyncSession queries stay sequential.
+        knowledge_result, result = await asyncio.gather(
+            store.search_knowledge(request.query, list(paper_map), min(8, request.top_k)),
+            store.search_chunks(request.query, list(paper_map), request.top_k, filters.chunk_types),
         )
         documents = (result.get("documents") or [[]])[0]
         metadatas = (result.get("metadatas") or [[]])[0]

@@ -55,7 +55,6 @@ async def process_paper(paper_id: uuid.UUID, task_id: uuid.UUID) -> None:
                 raise AppError("PAPER_PARSE_FAILED", "解析后没有可用正文块")
 
             vector_store = ChromaVectorStore()
-            await vector_store.delete_paper_chunks(str(paper.id))
             await session.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
             await session.execute(delete(PaperSection).where(PaperSection.paper_id == paper.id))
             await session.flush()
@@ -68,6 +67,7 @@ async def process_paper(paper_id: uuid.UUID, task_id: uuid.UUID) -> None:
                 key = (chunk.section_title, chunk.section_level or 1)
                 if key not in section_map:
                     section = PaperSection(
+                        id=uuid.uuid4(),
                         paper_id=paper.id,
                         title=chunk.section_title,
                         level=chunk.section_level or 1,
@@ -76,10 +76,11 @@ async def process_paper(paper_id: uuid.UUID, task_id: uuid.UUID) -> None:
                         page_end=chunk.page_end,
                     )
                     session.add(section)
-                    await session.flush()
                     section_map[key] = section.id
                     section_order += 1
 
+            # Flush all parent sections once before inserting their referencing chunks.
+            await session.flush()
             rows: list[PaperChunk] = []
             metadatas: list[dict[str, Any]] = []
             for chunk in chunks:
@@ -124,6 +125,7 @@ async def process_paper(paper_id: uuid.UUID, task_id: uuid.UUID) -> None:
                 message="正在生成默认向量并写入 Chroma",
             )
             await vector_store.index_chunks(
+                paper_id=str(paper.id),
                 ids=[row.chroma_id for row in rows],
                 documents=[row.content for row in rows],
                 metadatas=metadatas,

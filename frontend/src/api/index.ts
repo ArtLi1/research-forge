@@ -49,7 +49,9 @@ export const createMetadataDefinition = (payload: Partial<MetadataDefinition>) =
 export const setPaperMetadataValue = (paperId: string, definitionId: string, value: unknown) =>
   api.put(`/papers/${paperId}/metadata/${definitionId}`, { value }).then((r) => r.data)
 export const autoFillMetadata = (paperId: string, definitionId: string) =>
-  api.post(`/papers/${paperId}/metadata/${definitionId}/auto-fill`).then((r) => r.data)
+  api.post(`/papers/${paperId}/metadata/${definitionId}/auto-fill`, undefined, {
+    timeout: 300_000,
+  }).then((r) => r.data)
 export const comparePapers = (paperIds: string[]) =>
   api
     .post<ComparisonResult>('/papers/compare', { paper_ids: paperIds }, { timeout: 180_000 })
@@ -66,7 +68,9 @@ export const updateIdea = (ideaId: string, payload: Partial<UserIdea>) =>
   api.patch<UserIdea>(`/ideas/${ideaId}`, payload).then((r) => r.data)
 export const deleteIdea = (ideaId: string) => api.delete(`/ideas/${ideaId}`)
 export const evaluateIdea = (ideaId: string) =>
-  api.post<UserIdea>(`/ideas/${ideaId}/evaluate`).then((r) => r.data)
+  api.post<UserIdea>(`/ideas/${ideaId}/evaluate`, undefined, {
+    timeout: 300_000,
+  }).then((r) => r.data)
 export const getSchemes = (projectId: string) =>
   api.get<CandidateScheme[]>(`/projects/${projectId}/schemes`).then((r) => r.data)
 export const getScheme = (schemeId: string) =>

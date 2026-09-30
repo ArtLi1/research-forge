@@ -87,6 +87,8 @@ class KnowledgeSearchTool:
     ) -> None:
         self.session = session
         self.vector_store = vector_store or ChromaVectorStore()
+        # This tool lives for one workflow; keep its paper scope stable within that run.
+        self._paper_scopes: dict[uuid.UUID, list[str]] = {}
 
     async def run(
         self,
@@ -95,16 +97,19 @@ class KnowledgeSearchTool:
         knowledge_type: Literal["scenario", "algorithm"],
         limit: int = 15,
     ) -> list[RetrievedKnowledgeItem]:
-        paper_ids = list(
-            await self.session.scalars(
-                select(ProjectPaper.paper_id).where(ProjectPaper.project_id == project_id)
-            )
-        )
+        if project_id not in self._paper_scopes:
+            self._paper_scopes[project_id] = [
+                str(item)
+                for item in await self.session.scalars(
+                    select(ProjectPaper.paper_id).where(ProjectPaper.project_id == project_id)
+                )
+            ]
+        paper_ids = self._paper_scopes[project_id]
         if not paper_ids:
             return []
         result = await self.vector_store.search_knowledge(
             query,
-            [str(item) for item in paper_ids],
+            paper_ids,
             top_k=limit,
             knowledge_type=knowledge_type,
         )

@@ -3,7 +3,8 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import ProjectKnowledge, ProjectKnowledgeVersion
+from app.core.errors import not_found
+from app.models import Project, ProjectKnowledge, ProjectKnowledgeVersion
 from app.schemas.project_knowledge import (
     ProjectKnowledgeContent,
     ProjectKnowledgeItem,
@@ -29,24 +30,24 @@ class ProjectKnowledgeService:
         self.session = session
 
     async def list_current(self, project_id: uuid.UUID) -> list[ProjectKnowledgeRead]:
-        rows = list(
-            await self.session.scalars(
-                select(ProjectKnowledge)
-                .where(ProjectKnowledge.project_id == project_id)
-                .order_by(ProjectKnowledge.category)
+        rows = await self.session.execute(
+            select(ProjectKnowledge, ProjectKnowledgeVersion)
+            .join(
+                ProjectKnowledgeVersion,
+                ProjectKnowledgeVersion.id == ProjectKnowledge.current_version_id,
             )
+            .where(ProjectKnowledge.project_id == project_id)
+            .order_by(ProjectKnowledge.category)
         )
-        result: list[ProjectKnowledgeRead] = []
-        for row in rows:
-            if row.current_version_id is None:
-                continue
-            version = await self.session.get(ProjectKnowledgeVersion, row.current_version_id)
-            if version is not None:
-                result.append(self._read(row, version))
-        return result
+        return [self._read(row, version) for row, version in rows]
 
     async def add_adopted_idea(
-        self, project_id: uuid.UUID, idea_id: uuid.UUID, statement: str
+        self,
+        project_id: uuid.UUID,
+        idea_id: uuid.UUID,
+        statement: str,
+        *,
+        commit: bool = True,
     ) -> None:
         await self._append(
             project_id,
@@ -60,6 +61,7 @@ class ProjectKnowledgeService:
             ],
             change_summary=f"加入已采纳用户想法 {idea_id}",
             idea_id=idea_id,
+            commit=commit,
         )
 
     async def add_confirmed_scheme(
@@ -114,11 +116,19 @@ class ProjectKnowledgeService:
         added_idea_ids: set[uuid.UUID] | None = None,
         commit: bool = True,
     ) -> None:
+        # Lock the parent even when the category does not exist yet.
+        project = await self.session.scalar(
+            select(Project).where(Project.id == project_id).with_for_update()
+        )
+        if project is None:
+            raise not_found("project", project_id)
         row = await self.session.scalar(
-            select(ProjectKnowledge).where(
+            select(ProjectKnowledge)
+            .where(
                 ProjectKnowledge.project_id == project_id,
                 ProjectKnowledge.category == category,
             )
+            .execution_options(populate_existing=True)
         )
         current = ProjectKnowledgeContent()
         source_paper_ids: set[str] = set()
@@ -140,11 +150,12 @@ class ProjectKnowledgeService:
             (" ".join(item.statement.lower().split()), str(item.source_id))
             for item in current.items
         }
-        fresh = [
-            item
-            for item in additions
-            if (" ".join(item.statement.lower().split()), str(item.source_id)) not in known
-        ]
+        fresh = []
+        for item in additions:
+            key = (" ".join(item.statement.lower().split()), str(item.source_id))
+            if key not in known:
+                known.add(key)
+                fresh.append(item)
         if not fresh:
             return
         current.items.extend(fresh)

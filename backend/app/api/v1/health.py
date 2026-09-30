@@ -34,9 +34,12 @@ async def health() -> HealthResponse:
     settings = get_settings()
 
     async def check_postgres() -> ServiceHealth:
-        try:
+        async def probe() -> None:
             async with engine.connect() as connection:
-                await asyncio.wait_for(connection.execute(text("SELECT 1")), timeout=3)
+                await connection.execute(text("SELECT 1"))
+
+        try:
+            await asyncio.wait_for(probe(), timeout=3)
             return ServiceHealth(status="healthy")
         except Exception as exc:
             return ServiceHealth(status="unhealthy", detail=str(exc))

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage } from 'element-plus'
+import { ElButton, ElMessage, ElOption, ElSelect, ElTable, ElTableColumn, ElTag, ElTooltip } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 

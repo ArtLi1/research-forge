@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage } from 'element-plus'
+import { ElButton, ElInput, ElMessage, ElOption, ElRate, ElSelect, ElSwitch } from 'element-plus'
 import { reactive, watch } from 'vue'
 
 import { autoFillMetadata, setPaperMetadataValue } from '@/api'
@@ -9,6 +9,14 @@ const props = defineProps<{ paper: Paper; definitions: MetadataDefinition[] }>()
 const emit = defineEmits<{ refresh: [] }>()
 const values = reactive<Record<string, unknown>>({})
 const filling = reactive<Record<string, boolean>>({})
+
+function enumValue(definition: MetadataDefinition): string | string[] | undefined {
+  const value = values[definition.id]
+  if (definition.value_type === 'multi_enum') {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  }
+  return typeof value === 'string' ? value : undefined
+}
 
 watch(
   () => [props.paper, props.definitions] as const,
@@ -58,7 +66,7 @@ async function autoFill(definition: MetadataDefinition) {
       />
       <el-select
         v-else-if="['single_enum', 'multi_enum'].includes(definition.value_type)"
-        :model-value="values[definition.id]"
+        :model-value="enumValue(definition)"
         :multiple="definition.value_type === 'multi_enum'"
         clearable
         @update:model-value="values[definition.id] = $event"

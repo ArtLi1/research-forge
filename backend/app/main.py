@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.errors import AppError
+from app.db.session import engine
 
 logger = structlog.get_logger()
 
@@ -18,7 +19,10 @@ logger = structlog.get_logger()
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     settings.paper_storage_dir.mkdir(parents=True, exist_ok=True)
-    yield
+    try:
+        yield
+    finally:
+        await engine.dispose()
 
 
 settings = get_settings()
