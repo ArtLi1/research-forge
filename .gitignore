@@ -23,6 +23,7 @@ htmlcov/
 build/
 dist/
 tmp/
+output/
 
 # Local application data and test artifacts
 backend/.pytest_tmp/
