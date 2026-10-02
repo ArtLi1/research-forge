@@ -1,27 +1,24 @@
+import os
 import sys
 
 from redis import Redis
 from rq import Queue
-from rq.worker import SimpleWorker
+from rq.worker import SimpleWorker, Worker
 
 from app.core.config import get_settings
+from app.core.logging import configure_logging
+from app.tasks.types import TASK_SPECS
 
 
 def main() -> None:
-    connection = Redis.from_url(get_settings().redis_url)
-    names = sys.argv[1:] or [
-        "paper_parse",
-        "knowledge_extract",
-        "project_update",
-        "scheme_generate",
-        "default",
-    ]
-    queues = [
-        Queue(name, connection=connection)
-        for name in names
-    ]
-    # RQ's fork/spawn workers call os.wait4 in 2.10, which is unavailable on Windows.
-    SimpleWorker(queues, connection=connection).work(with_scheduler=False)
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    names = sys.argv[1:] or [str(kind) for kind in TASK_SPECS]
+    with Redis.from_url(settings.redis_url, socket_connect_timeout=5) as connection:
+        queues = [Queue(name, connection=connection) for name in names]
+        # The async runner enforces deadlines and DB heartbeats on both platforms.
+        worker = SimpleWorker if os.name == "nt" else Worker
+        worker(queues, connection=connection).work(with_scheduler=False)
 
 
 if __name__ == "__main__":

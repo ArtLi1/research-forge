@@ -1,11 +1,10 @@
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from redis.asyncio import Redis
 from sqlalchemy import text
 
 from app.core.config import get_settings
-from app.db.session import engine
 from app.providers.chroma import ChromaVectorStore
 from app.providers.embedding import ChromaDefaultEmbeddingProvider
 from app.schemas.common import HealthResponse, ServiceHealth, SystemSettingsRead
@@ -30,27 +29,27 @@ async def system_settings() -> SystemSettingsRead:
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
+async def health(request: Request) -> HealthResponse:
     settings = get_settings()
 
     async def check_postgres() -> ServiceHealth:
         async def probe() -> None:
-            async with engine.connect() as connection:
+            async with request.app.state.database.engine.connect() as connection:
                 await connection.execute(text("SELECT 1"))
 
         try:
             await asyncio.wait_for(probe(), timeout=3)
             return ServiceHealth(status="healthy")
-        except Exception as exc:
-            return ServiceHealth(status="unhealthy", detail=str(exc))
+        except Exception:
+            return ServiceHealth(status="unhealthy", detail="数据库连接失败")
 
     async def check_redis() -> ServiceHealth:
         client = Redis.from_url(settings.redis_url)
         try:
             await asyncio.wait_for(client.ping(), timeout=3)
             return ServiceHealth(status="healthy")
-        except Exception as exc:
-            return ServiceHealth(status="unhealthy", detail=str(exc))
+        except Exception:
+            return ServiceHealth(status="unhealthy", detail="任务队列连接失败")
         finally:
             await client.aclose()
 
@@ -58,8 +57,8 @@ async def health() -> HealthResponse:
         try:
             await asyncio.wait_for(asyncio.to_thread(ChromaVectorStore().heartbeat), timeout=3)
             return ServiceHealth(status="healthy")
-        except Exception as exc:
-            return ServiceHealth(status="unhealthy", detail=str(exc))
+        except Exception:
+            return ServiceHealth(status="unhealthy", detail="向量服务连接失败")
 
     postgres, redis, chroma = await asyncio.gather(check_postgres(), check_redis(), check_chroma())
     services = {

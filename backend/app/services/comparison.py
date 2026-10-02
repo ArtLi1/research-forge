@@ -43,6 +43,7 @@ class ComparisonService:
                 }
             )
         provider = OpenAICompatibleChatProvider()
+        await self.session.commit()
         result = await provider.generate_structured(
             [
                 {"role": "system", "content": load_prompt("compare_papers_v1.md")},

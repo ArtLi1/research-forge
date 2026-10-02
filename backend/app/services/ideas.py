@@ -3,10 +3,11 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.scheme_tools import build_default_scheme_tools
-from app.core.errors import not_found
+from app.agents.context import ResearchContextService
+from app.core.errors import AppError, not_found
 from app.models import Project, UserIdea
 from app.providers.chat import OpenAICompatibleChatProvider, load_prompt
+from app.rag.retrieval import KnowledgeRetriever
 from app.schemas.project_knowledge import IdeaEvaluation, UserIdeaCreate, UserIdeaUpdate
 from app.services.project_knowledge import ProjectKnowledgeService
 
@@ -49,7 +50,7 @@ class IdeaService:
         return idea
 
     async def update(self, idea_id: uuid.UUID, data: UserIdeaUpdate) -> UserIdea:
-        idea = await self.get(idea_id)
+        idea = await self._locked(idea_id)
         old_status = idea.status
         for key, value in data.model_dump(exclude_unset=True, mode="json").items():
             setattr(idea, key, value)
@@ -62,21 +63,21 @@ class IdeaService:
         return idea
 
     async def delete(self, idea_id: uuid.UUID) -> None:
-        idea = await self.get(idea_id)
+        idea = await self._locked(idea_id)
         await self.session.delete(idea)
         await self.session.commit()
 
     async def evaluate(self, idea_id: uuid.UUID) -> UserIdea:
         idea = await self.get(idea_id)
         project = await self.session.get(Project, idea.project_id)
-        assert project is not None
-        tools = build_default_scheme_tools(self.session)
-        scenarios = await tools.knowledge_search.run(
-            idea.project_id, idea.content, "scenario", limit=10
-        )
-        algorithms = await tools.knowledge_search.run(
-            idea.project_id, idea.content, "algorithm", limit=10
-        )
+        if project is None:
+            raise not_found("project", idea.project_id)
+        expected_content = idea.content
+        state = await ResearchContextService(self.session).load(idea.project_id, idea.content)
+        await self.session.commit()
+        retriever = KnowledgeRetriever()
+        scenarios = await retriever.search(state.scope, idea.content, "scenario", limit=10)
+        algorithms = await retriever.search(state.scope, idea.content, "algorithm", limit=10)
         provider = OpenAICompatibleChatProvider()
         evaluation = await provider.generate_structured(
             [
@@ -98,7 +99,21 @@ class IdeaService:
             IdeaEvaluation,
             temperature=0,
         )
+        idea = await self._locked(idea_id)
+        if idea.content != expected_content:
+            raise AppError("IDEA_VERSION_CONFLICT", "想法已修改，请重新评估", status_code=409)
         idea.agent_evaluation = evaluation.model_dump(mode="json")
         await self.session.commit()
         await self.session.refresh(idea)
+        return idea
+
+    async def _locked(self, idea_id: uuid.UUID) -> UserIdea:
+        idea = await self.session.scalar(
+            select(UserIdea)
+            .where(UserIdea.id == idea_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if idea is None:
+            raise not_found("idea", idea_id)
         return idea

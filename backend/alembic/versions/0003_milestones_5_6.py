@@ -67,18 +67,14 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["candidate_id"], ["candidate_schemes.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["candidate_id"], ["candidate_schemes.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
             ["parent_version_id"], ["candidate_versions.id"], ondelete="SET NULL"
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("candidate_id", "version_number"),
     )
-    op.create_index(
-        "ix_candidate_versions_candidate_id", "candidate_versions", ["candidate_id"]
-    )
+    op.create_index("ix_candidate_versions_candidate_id", "candidate_versions", ["candidate_id"])
 
     op.create_table(
         "agent_runs",
@@ -100,9 +96,7 @@ def upgrade() -> None:
         ),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["candidate_id"], ["candidate_schemes.id"], ondelete="SET NULL"
-        ),
+        sa.ForeignKeyConstraint(["candidate_id"], ["candidate_schemes.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )

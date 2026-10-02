@@ -1,6 +1,5 @@
 import json
 import re
-from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 from openai import AsyncOpenAI
@@ -8,6 +7,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.config import get_settings
 from app.core.errors import AppError
+from app.prompts import get_prompt
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -36,27 +36,30 @@ class OpenAICompatibleChatProvider:
                 status_code=503,
             )
         self.model = selected_model
-        self.client = AsyncOpenAI(
+        self.options: dict[str, Any] = dict(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+        self.max_tokens = settings.llm_output_tokens
 
     async def generate_text(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                **kwargs,
-            )
+            async with AsyncOpenAI(**self.options) as client:
+                response = await client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,  # type: ignore[arg-type]
+                    **{"max_tokens": self.max_tokens, **kwargs},
+                )
+            if not response.choices or response.choices[0].finish_reason == "length":
+                raise ValueError("Empty or truncated model response")
             return response.choices[0].message.content or ""
         except Exception as exc:
             raise AppError(
                 "MODEL_PROVIDER_ERROR",
                 "模型调用失败",
                 status_code=502,
-                details={"reason": str(exc)},
             ) from exc
 
     async def generate_structured(
@@ -69,22 +72,31 @@ class OpenAICompatibleChatProvider:
             "\n只输出一个 JSON 对象，不要使用 Markdown。必须严格符合此 JSON Schema：\n"
             + json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         )
+        if not messages:
+            raise AppError("MODEL_PROVIDER_ERROR", "模型输入不能为空")
         working = [*messages]
         working[-1] = {
             **working[-1],
             "content": working[-1]["content"] + schema_instruction,
         }
         last_error = ""
+        options = {"response_format": {"type": "json_object"}, **kwargs}
         for attempt in range(2):
             raw = await self.generate_text(
                 working,
-                response_format={"type": "json_object"},
-                **kwargs,
+                **options,
             )
             try:
                 return response_model.model_validate_json(self._extract_json(raw))
             except (ValidationError, ValueError) as exc:
-                last_error = str(exc)
+                if isinstance(exc, ValidationError):
+                    last_error = json.dumps(
+                        exc.errors(include_input=False, include_url=False),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                else:
+                    last_error = "Invalid JSON object"
                 if attempt == 0:
                     working.extend(
                         [
@@ -102,7 +114,6 @@ class OpenAICompatibleChatProvider:
             "MODEL_PROVIDER_ERROR",
             "模型结构化输出连续两次校验失败",
             status_code=502,
-            details={"validation_error": last_error},
         )
 
     @staticmethod
@@ -113,10 +124,4 @@ class OpenAICompatibleChatProvider:
 
 
 def load_prompt(name: str, *, offloading_guidance: bool = False) -> str:
-    directory = Path(__file__).resolve().parents[1] / "prompts"
-    prompt = (directory / name).read_text(encoding="utf-8")
-    if offloading_guidance:
-        prompt += "\n\n" + (directory / "offloading_research_guidance_v1.md").read_text(
-            encoding="utf-8"
-        )
-    return prompt
+    return get_prompt(name, offloading=offloading_guidance).content

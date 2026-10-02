@@ -81,7 +81,7 @@ Copy-Item .env.example .env
 | `POSTGRES_HOST`、`POSTGRES_PORT`、`POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB` | PostgreSQL 连接信息 |
 | `REDIS_HOST`、`REDIS_PORT`、`REDIS_DB` | Redis 连接信息 |
 | `CHROMA_HOST`、`CHROMA_PORT`、`CHROMA_DATA_DIR` | Chroma 监听地址与本地数据目录 |
-| `PAPER_STORAGE_DIR` | 上传论文的存储目录；相对路径以服务工作目录为基准 |
+| `PAPER_STORAGE_DIR` | 上传论文的存储目录；相对路径固定以 `backend` 为基准 |
 | `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL` | 模型服务地址、密钥与默认模型 |
 | `LLM_EXTRACTION_MODEL` | 知识提取模型，填写服务支持的模型名称 |
 
@@ -115,7 +115,7 @@ conda run -n drl alembic upgrade head
 
 ```powershell
 conda run --no-capture-output -n drl python -m app.scripts.run_chroma
-conda run --no-capture-output -n drl python -m app.scripts.run_worker paper_parse project_update scheme_generate default
+conda run --no-capture-output -n drl python -m app.scripts.run_worker paper_parse scheme_generate
 conda run --no-capture-output -n drl python -m app.scripts.run_worker knowledge_extract
 conda run --no-capture-output -n drl uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
@@ -149,13 +149,14 @@ npm run dev
 .
 ├── backend/
 │   ├── app/
-│   │   ├── agents/        # Agent 状态与工具
+│   │   ├── agents/        # 类型化状态、上下文快照、独立工作流与运行协调
 │   │   ├── api/           # API 路由
 │   │   ├── models/        # 数据模型
 │   │   ├── prompts/       # 提示词模板
 │   │   ├── providers/     # 模型、存储与向量服务
-│   │   ├── services/      # 业务逻辑与工作流
-│   │   └── tasks/         # 后台任务
+│   │   ├── rag/           # 检索范围、知识预算、结果解码与去重
+│   │   ├── services/      # 产品用例、版本检查与人工确认事务
+│   │   └── tasks/         # 统一运行器、租约、心跳、恢复与派发
 │   ├── alembic/           # 数据库迁移
 │   ├── scripts/           # 集成验收脚本
 │   └── tests/
@@ -171,9 +172,16 @@ npm run dev
 本地代码导航维护在根目录 `CODE_INDEX.md`（由 `.gitignore` 排除，首次建立后按修改增量更新）。
 先查询索引，再沿相关调用链读取代码；修改后同步职责和调用关系，以实际代码为准。
 
+内部设计、工作流和事务边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
 后台队列提交统一由 `TaskService` 处理，同步 Redis/RQ 操作在线程中执行。
+数据库任务是持久化待派发记录；Redis 暂不可用时保留排队状态，API 内的调度器会继续派发。
+运行器领取带令牌的租约并续租，过期任务会恢复，旧工作进程不能提交结果。
+LangGraph 每完成一个阶段便保存 `AgentRun.checkpoint`，进程中断后从最近阶段继续。
+所有候选方案及任务成功状态在同一事务提交；模型服务调用仍为至少一次语义。
 任务事件支持进度、完成、失败、取消和保活；前端切换任务或离开页面时关闭旧连接。
-向量重建在新内容写入成功后清理同篇论文的旧向量，避免模型调用或写入失败时提前清空旧索引。
+正文只检索数据库已激活的块，知识按当前版本检索；已提交知识历史保留以支持正在执行的研究快照。
+向量重建分批写入，成功后只清理开始前观察到的旧正文或未提交知识，避免删除后续任务索引。
 数据库与 Chroma 的写入并非跨服务原子事务，失败后仍需通过任务重试完成一致性恢复。
 
 在仓库根目录执行后端检查：
@@ -183,6 +191,7 @@ Set-Location backend
 conda run -n drl pytest -q
 conda run -n drl ruff check .
 conda run -n drl mypy app
+conda run -n drl ruff format --check app tests alembic
 ```
 
 进入前端目录执行测试、静态检查与构建：
@@ -199,3 +208,21 @@ npm run build
 ```powershell
 conda run -n drl python scripts\smoke_m0_m2.py
 ```
+
+默认测试使用临时 SQLite，模型、队列和向量服务由可控适配器替代；真实 PDF、HTTP 接口、
+数据库事务、工作流恢复及人工确认均参与测试。设置 `TEST_DATABASE_URL` 为专用 PostgreSQL
+测试库时，每个测试建立独立临时 schema，并验证真实并发领取。CI 同时执行 PostgreSQL
+迁移、一致性检查、后端测试以及前端检查。测试不会访问所配置的真实 LLM。
+
+## 升级已有部署
+
+先停止旧 API 和所有 Worker，备份 PostgreSQL 与论文/Chroma 数据，然后在 `backend` 中执行
+`alembic upgrade head`，再使用原启动入口启动新版。迁移 `0004` 增加任务租约与 Agent 检查点；
+旧未完成任务重新排队，同篇论文只保留较新的处理任务，已有论文、知识、方案与历史版本保留。
+旧运行不具有可恢复检查点，将作为中断记录保留。不要同时运行升级前后的 Worker。
+
+生产部署使用常驻进程管理器启动 API/Worker，不使用开发模式的 `--reload`。
+增加并行任务容量可启动更多 Worker；API 调度器使用数据库行锁协调多个实例。
+保持 `TASK_LEASE_SECONDS` 至少为心跳间隔的三倍，设置模型超时、输出预算、检索并发与修正次数。
+业务日志为带请求/任务 ID 的 JSON，公开接口只返回可供用户处理的错误。
+本产品保持单用户定位，部署在受信网络或带认证的反向代理之后。

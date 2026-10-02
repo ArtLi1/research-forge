@@ -2,7 +2,9 @@ import re
 import uuid
 from pathlib import Path
 
+import structlog
 from fastapi import UploadFile
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -12,6 +14,8 @@ from app.providers.storage import LocalPaperStorage
 from app.repositories.papers import PaperRepository
 from app.schemas.paper import PaperUploadResult
 from app.services.tasks import TaskService
+
+logger = structlog.get_logger()
 
 
 def normalize_title(title: str) -> str:
@@ -46,6 +50,7 @@ class PaperService:
             )
         if project_id is not None and await self.session.get(Project, project_id) is None:
             raise not_found("project", project_id)
+        await self.session.commit()
 
         results: list[PaperUploadResult] = []
         for upload in files:
@@ -65,7 +70,7 @@ class PaperService:
                 await self.session.commit()
             return PaperUploadResult(paper=existing, task_id=None, duplicate=True)
 
-        title = Path(upload.filename or "untitled.pdf").stem.strip() or "Untitled"
+        title = (Path(upload.filename or "untitled.pdf").stem.strip() or "Untitled")[:1000]
         paper = Paper(
             id=paper_id,
             title=title,
@@ -82,15 +87,37 @@ class PaperService:
             task_type="paper_parse",
             resource_type="paper",
             resource_id=paper.id,
+            active_key=f"paper:{paper.id}",
         )
-        await self.repo.add(paper)
-        self.session.add(task)
-        await self.session.flush()
-        if project_id is not None:
-            await self._associate_if_missing(project_id, paper.id)
-        await self.session.commit()
+        try:
+            await self.repo.add(paper)
+            self.session.add(task)
+            await self.session.flush()
+            if project_id is not None:
+                await self._associate_if_missing(project_id, paper.id)
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
+            self.storage.delete(path)
+            existing = await self.repo.by_hash(file_hash)
+            if existing is None:
+                raise
+            if project_id is not None:
+                await self._associate_if_missing(project_id, existing.id)
+                await self.session.commit()
+            return PaperUploadResult(paper=existing, task_id=None, duplicate=True)
+        except BaseException:
+            await self.session.rollback()
+            # Commit acknowledgement can be lost after PostgreSQL has committed.
+            # Preserve a file unless the database confirms it has no owner.
+            try:
+                if await self.session.get(Paper, paper_id) is None:
+                    self.storage.delete(path)
+            except Exception:
+                logger.exception("upload_persistence_uncertain", paper_id=str(paper_id))
+            raise
         await self.session.refresh(paper)
-        await self.enqueue(task)
+        await TaskService(self.session).dispatch(task.id)
         return PaperUploadResult(paper=paper, task_id=task.id, duplicate=False)
 
     async def reparse(self, paper_id: uuid.UUID) -> BackgroundTask:
@@ -101,10 +128,11 @@ class PaperService:
             task_type="paper_parse",
             resource_type="paper",
             resource_id=paper.id,
+            active_key=f"paper:{paper.id}",
         )
         self.session.add(task)
-        await self.session.commit()
-        await self.enqueue(task)
+        await self._commit_task()
+        await TaskService(self.session).dispatch(task.id)
         return task
 
     async def extract(self, paper_id: uuid.UUID) -> BackgroundTask:
@@ -119,14 +147,11 @@ class PaperService:
             task_type="knowledge_extract",
             resource_type="paper",
             resource_id=paper.id,
+            active_key=f"paper:{paper.id}",
         )
         self.session.add(task)
-        await self.session.commit()
-        await self.enqueue(
-            task,
-            job_path="app.tasks.knowledge.extract_knowledge_job",
-            job_timeout=7200,
-        )
+        await self._commit_task()
+        await TaskService(self.session).dispatch(task.id)
         return task
 
     async def _associate_if_missing(self, project_id: uuid.UUID, paper_id: uuid.UUID) -> None:
@@ -140,11 +165,9 @@ class PaperService:
                 )
             )
 
-    async def enqueue(
-        self,
-        task: BackgroundTask,
-        *,
-        job_path: str = "app.tasks.paper_processing.process_paper_job",
-        job_timeout: int = 1800,
-    ) -> None:
-        await TaskService(self.session).enqueue(task, job_path=job_path, job_timeout=job_timeout)
+    async def _commit_task(self) -> None:
+        try:
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AppError("PAPER_TASK_ACTIVE", "该论文已有任务正在处理", status_code=409) from exc

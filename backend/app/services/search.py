@@ -5,8 +5,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError, not_found
-from app.models import Paper, Project, ProjectPaper
+from app.models import Paper, PaperChunk, PaperKnowledgeCard, Project, ProjectPaper
 from app.providers.chroma import ChromaVectorStore
+from app.rag.retrieval import vector_rows
 from app.schemas.paper import EvidencePack, EvidencePackItem, SearchRequest
 
 
@@ -45,21 +46,37 @@ class SearchService:
                 missing_information=["没有检索到符合范围的正文或知识"],
             )
         store = ChromaVectorStore()
+        version_ids = [
+            str(item)
+            for item in await self.session.scalars(
+                select(PaperKnowledgeCard.current_version_id).where(
+                    PaperKnowledgeCard.paper_id.in_([paper.id for paper in papers]),
+                    PaperKnowledgeCard.current_version_id.is_not(None),
+                )
+            )
+        ]
+        await self.session.commit()
         # Only vector calls run concurrently; AsyncSession queries stay sequential.
         knowledge_result, result = await asyncio.gather(
-            store.search_knowledge(request.query, list(paper_map), min(8, request.top_k)),
+            store.search_knowledge(
+                request.query, list(paper_map), min(8, request.top_k), version_ids=version_ids
+            ),
             store.search_chunks(request.query, list(paper_map), request.top_k, filters.chunk_types),
         )
-        documents = (result.get("documents") or [[]])[0]
-        metadatas = (result.get("metadatas") or [[]])[0]
-        distances = (result.get("distances") or [[]])[0]
+        chunk_rows = vector_rows(result)
+        active_chunk_ids = set(
+            await self.session.scalars(
+                select(PaperChunk.chroma_id).where(
+                    PaperChunk.paper_id.in_([paper.id for paper in papers]),
+                    PaperChunk.chroma_id.in_([row[0] for row in chunk_rows]),
+                )
+            )
+        )
+        await self.session.commit()
         items: list[EvidencePackItem] = []
-        k_documents = (knowledge_result.get("documents") or [[]])[0]
-        k_metadatas = (knowledge_result.get("metadatas") or [[]])[0]
-        k_distances = (knowledge_result.get("distances") or [[]])[0]
-        for document, metadata, distance in zip(k_documents, k_metadatas, k_distances, strict=True):
-            paper = paper_map.get(str(metadata["paper_id"]))
-            if paper is None:
+        for _, document, metadata, score in vector_rows(knowledge_result):
+            paper = paper_map.get(str(metadata.get("paper_id")))
+            if paper is None or metadata.get("knowledge_version_id") not in version_ids:
                 continue
             knowledge_type = str(metadata.get("knowledge_type", ""))
             items.append(
@@ -74,12 +91,12 @@ class SearchService:
                     page_start=None,
                     page_end=None,
                     source_type="knowledge_inspiration",
-                    score=max(0.0, 1.0 - float(distance)),
+                    score=score,
                 )
             )
-        for document, metadata, distance in zip(documents, metadatas, distances, strict=True):
-            paper = paper_map.get(str(metadata["paper_id"]))
-            if paper is None:
+        for vector_id, document, metadata, score in chunk_rows:
+            paper = paper_map.get(str(metadata.get("paper_id")))
+            if paper is None or vector_id not in active_chunk_ids:
                 continue
             items.append(
                 EvidencePackItem(
@@ -90,7 +107,7 @@ class SearchService:
                     section=metadata.get("section"),
                     page_start=metadata.get("page_start"),
                     page_end=metadata.get("page_end"),
-                    score=max(0.0, 1.0 - float(distance)),
+                    score=score,
                 )
             )
         deduplicated: list[EvidencePackItem] = []

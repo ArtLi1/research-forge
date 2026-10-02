@@ -4,9 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.providers import chat
+from app.rag.knowledge import KnowledgeExtractor, merge_knowledge, stage_knowledge
 from app.schemas.knowledge import AlgorithmKnowledge, PaperKnowledgeContent, ScenarioKnowledge
-from app.services import knowledge
-from app.services.knowledge import merge_knowledge
 
 
 def test_chat_provider_accepts_extraction_model_override(monkeypatch) -> None:
@@ -16,6 +15,7 @@ def test_chat_provider_accepts_extraction_model_override(monkeypatch) -> None:
         llm_model="deepseek-v4-pro",
         llm_timeout_seconds=300,
         llm_max_retries=2,
+        llm_output_tokens=8192,
     )
     monkeypatch.setattr(chat, "get_settings", lambda: settings)
     monkeypatch.setattr(chat, "AsyncOpenAI", lambda **_: object())
@@ -71,7 +71,6 @@ async def test_knowledge_index_creates_one_typed_vector_per_item(monkeypatch) ->
         async def index_knowledge(self, **values) -> None:
             captured.update(values)
 
-    monkeypatch.setattr(knowledge, "ChromaVectorStore", lambda: VectorStore())
     paper_id, version_id = uuid.uuid4(), uuid.uuid4()
     content = PaperKnowledgeContent(
         scenarios=[
@@ -91,9 +90,7 @@ async def test_knowledge_index_creates_one_typed_vector_per_item(monkeypatch) ->
         ],
     )
 
-    await knowledge.KnowledgeService(SimpleNamespace())._index(  # type: ignore[arg-type]  # noqa: SLF001
-        paper_id, version_id, content
-    )
+    await stage_knowledge(VectorStore(), paper_id, version_id, content)
 
     assert captured["ids"] == [
         f"{version_id}:scenario:0",
@@ -105,3 +102,12 @@ async def test_knowledge_index_creates_one_typed_vector_per_item(monkeypatch) ->
     ]
     assert "Challenge:" in captured["documents"][0]  # type: ignore[index]
     assert "Mechanism:" in captured["documents"][1]  # type: ignore[index]
+    assert captured["replace"] is False
+
+
+def test_large_tables_and_body_respect_extraction_budget():
+    extractor = KnowledgeExtractor(SimpleNamespace(), max_chars=1000)
+    contents = ["table" * 1100, "body" * 750]
+    batches = extractor.batches(contents)
+    assert max(map(len, batches)) <= 1000
+    assert "".join(batches).replace("\n\n", "") == "".join(contents)

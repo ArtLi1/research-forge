@@ -1,9 +1,11 @@
+import json
 import uuid
 from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import AppError, not_found
 from app.models import (
     Evidence,
@@ -13,6 +15,7 @@ from app.models import (
     ProjectPaper,
 )
 from app.providers.chat import OpenAICompatibleChatProvider, load_prompt
+from app.rag.knowledge import normalize_text
 from app.schemas.knowledge import (
     MetadataAutoFillResult,
     MetadataDefinitionCreate,
@@ -66,6 +69,28 @@ class MetadataService:
             raise not_found("metadata_definition", definition_id)
         return definition
 
+    async def _locked_definition(self, definition_id: uuid.UUID) -> MetadataDefinition:
+        definition = await self.session.scalar(
+            select(MetadataDefinition)
+            .where(MetadataDefinition.id == definition_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if definition is None:
+            raise not_found("metadata_definition", definition_id)
+        return definition
+
+    @staticmethod
+    def _definition_snapshot(definition: MetadataDefinition) -> tuple[Any, ...]:
+        return (
+            definition.name,
+            definition.description,
+            definition.value_type,
+            tuple(definition.options or []),
+            definition.auto_extract,
+            definition.scope,
+        )
+
     async def create(self, data: MetadataDefinitionCreate) -> MetadataDefinition:
         definition = MetadataDefinition(**data.model_dump())
         self.session.add(definition)
@@ -76,7 +101,7 @@ class MetadataService:
     async def update(
         self, definition_id: uuid.UUID, data: MetadataDefinitionUpdate
     ) -> MetadataDefinition:
-        definition = await self.get(definition_id)
+        definition = await self._locked_definition(definition_id)
         for key, value in data.model_dump(exclude_unset=True).items():
             setattr(definition, key, value)
         if definition.value_type in {"single_enum", "multi_enum"} and not definition.options:
@@ -86,7 +111,7 @@ class MetadataService:
         return definition
 
     async def delete(self, definition_id: uuid.UUID) -> None:
-        definition = await self.get(definition_id)
+        definition = await self._locked_definition(definition_id)
         key = str(definition.id)
         if definition.scope == "global_paper":
             papers = list(await self.session.scalars(select(Paper)))
@@ -110,7 +135,12 @@ class MetadataService:
         await self.session.commit()
 
     async def update_paper_metadata(self, paper_id: uuid.UUID, data: PaperMetadataUpdate) -> Paper:
-        paper = await self.session.get(Paper, paper_id)
+        paper = await self.session.scalar(
+            select(Paper)
+            .where(Paper.id == paper_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if paper is None:
             raise not_found("paper", paper_id)
         fixed = data.model_dump(exclude_unset=True, exclude={"custom_values"}, mode="python")
@@ -135,11 +165,18 @@ class MetadataService:
         paper_id: uuid.UUID,
         value: Any,
         project_id: uuid.UUID | None = None,
+        *,
+        commit: bool = True,
     ) -> Any:
-        definition = await self.get(definition_id)
+        definition = await self._locked_definition(definition_id)
         checked = validate_metadata_value(definition, value)
         if definition.scope == "global_paper":
-            paper = await self.session.get(Paper, paper_id)
+            paper = await self.session.scalar(
+                select(Paper)
+                .where(Paper.id == paper_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             if paper is None:
                 raise not_found("paper", paper_id)
             values = dict(paper.global_metadata)
@@ -148,15 +185,19 @@ class MetadataService:
         else:
             if project_id is None:
                 raise AppError("INVALID_METADATA_VALUE", "项目论文字段必须提供 project_id")
-            link = await self.session.get(
-                ProjectPaper, {"project_id": project_id, "paper_id": paper_id}
+            link = await self.session.scalar(
+                select(ProjectPaper)
+                .where(ProjectPaper.project_id == project_id, ProjectPaper.paper_id == paper_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if link is None:
                 raise not_found("paper", paper_id)
             values = dict(link.project_metadata)
             values[str(definition.id)] = checked
             link.project_metadata = values
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
         return checked
 
     async def auto_fill(
@@ -169,7 +210,29 @@ class MetadataService:
         if not definition.auto_extract:
             raise AppError("INVALID_METADATA_VALUE", "该字段未启用 Agent 自动填充")
         knowledge = await KnowledgeService(self.session).get(paper_id)
+        expected_definition = self._definition_snapshot(definition)
+        evidence_chunks = []
+        remaining = get_settings().knowledge_batch_chars
+        for source_chunk in await self.session.scalars(
+            select(PaperChunk)
+            .where(PaperChunk.paper_id == paper_id)
+            .order_by(PaperChunk.order_index)
+            .limit(24)
+        ):
+            if remaining <= 0:
+                break
+            content = source_chunk.content[:remaining]
+            evidence_chunks.append(
+                {
+                    "chunk_id": str(source_chunk.id),
+                    "content": content,
+                    "page_start": source_chunk.page_start,
+                    "page_end": source_chunk.page_end,
+                }
+            )
+            remaining -= len(content)
         provider = OpenAICompatibleChatProvider()
+        await self.session.commit()
         result = await provider.generate_structured(
             [
                 {"role": "system", "content": load_prompt("extract_metadata_v1.md")},
@@ -179,26 +242,44 @@ class MetadataService:
                         f"字段名称：{definition.name}\n字段说明：{definition.description}\n"
                         f"类型：{definition.value_type}\n选项：{definition.options}\n"
                         f"论文知识卡：{knowledge.content.model_dump(mode='json')}"
+                        f"\n可引用正文块：{json.dumps(evidence_chunks, ensure_ascii=False)}"
                     ),
                 },
             ],
             MetadataAutoFillResult,
             temperature=0,
         )
+        definition = await self._locked_definition(definition_id)
+        current = await KnowledgeService(self.session).get(paper_id)
+        if (
+            self._definition_snapshot(definition) != expected_definition
+            or current.version_id != knowledge.version_id
+        ):
+            raise AppError(
+                "METADATA_CONTEXT_CONFLICT", "字段或知识已变化，请重新提取", status_code=409
+            )
         result.value = validate_metadata_value(definition, result.value)
-        await self.set_value(definition_id, paper_id, result.value, project_id)
+        await self.set_value(definition_id, paper_id, result.value, project_id, commit=False)
         chunk_ids = {ref.chunk_id for ref in result.evidence}
         chunks = {
             row.id: row
             for row in await self.session.scalars(
-                select(PaperChunk).where(PaperChunk.id.in_(chunk_ids))
+                select(PaperChunk).where(
+                    PaperChunk.id.in_(chunk_ids), PaperChunk.paper_id == paper_id
+                )
             )
         }
+        accepted_refs = []
         for ref in result.evidence:
             chunk = chunks.get(ref.chunk_id)
-            if chunk and KnowledgeService._normalize(ref.quote) in KnowledgeService._normalize(
-                chunk.content
+            quote = normalize_text(ref.quote)
+            if (
+                chunk
+                and quote
+                and quote in normalize_text(chunk.content)
+                and (ref.page is None or chunk.page_start <= ref.page <= chunk.page_end)
             ):
+                accepted_refs.append(ref)
                 self.session.add(
                     Evidence(
                         paper_id=paper_id,
@@ -214,4 +295,5 @@ class MetadataService:
                     )
                 )
         await self.session.commit()
+        result.evidence = accepted_refs
         return result

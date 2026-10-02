@@ -55,6 +55,13 @@ class ChromaVectorStore:
         }
         chunks = self.client.get_or_create_collection(PAPER_CHUNKS, metadata=metadata)
         knowledge = self.client.get_or_create_collection(PAPER_KNOWLEDGE, metadata=metadata)
+        for collection in (chunks, knowledge):
+            actual = collection.metadata or {}
+            for key in ("embedding_model", "embedding_dimension", "index_version", "hnsw:space"):
+                if key in actual and actual[key] != metadata[key]:
+                    raise AppError(
+                        "VECTOR_CONFIG_ERROR", "向量集合配置与当前模型不一致", status_code=503
+                    )
         return chunks, knowledge
 
     async def index_chunks(
@@ -68,20 +75,29 @@ class ChromaVectorStore:
         if not ids:
             return
         try:
-            vectors = await self.embedding.embed_documents(documents)
             chunks, _ = await asyncio.to_thread(self.ensure_collections)
-            await self._write(chunks, ids, documents, metadatas, vectors, paper_id=paper_id)
+            await self._index(chunks, ids, documents, metadatas, paper_id=paper_id)
         except Exception as exc:
             raise AppError(
                 "VECTOR_INDEX_ERROR",
                 "向量索引写入失败",
                 status_code=502,
-                details={"reason": str(exc)},
             ) from exc
 
     async def delete_paper_chunks(self, paper_id: str) -> None:
         chunks, _ = await asyncio.to_thread(self.ensure_collections)
         await asyncio.to_thread(chunks.delete, where={"paper_id": paper_id})
+
+    async def paper_vector_ids(self, paper_id: str, *, knowledge: bool = False) -> list[str]:
+        collections = await asyncio.to_thread(self.ensure_collections)
+        collection = collections[1 if knowledge else 0]
+        previous = await asyncio.to_thread(collection.get, where={"paper_id": paper_id}, include=[])
+        return list(previous["ids"])
+
+    async def delete_vectors(self, ids: list[str], *, knowledge: bool = False) -> None:
+        if ids:
+            collections = await asyncio.to_thread(self.ensure_collections)
+            await asyncio.to_thread(collections[1 if knowledge else 0].delete, ids=ids)
 
     async def _write(
         self,
@@ -90,15 +106,7 @@ class ChromaVectorStore:
         documents: list[str],
         metadatas: list[dict[str, Any]],
         vectors: list[list[float]],
-        *,
-        paper_id: str | None = None,
     ) -> None:
-        old_ids: list[str] = []
-        if paper_id is not None:
-            previous = await asyncio.to_thread(
-                collection.get, where={"paper_id": paper_id}, include=[]
-            )
-            old_ids = previous["ids"]
         if ids:
             await asyncio.to_thread(
                 collection.upsert,
@@ -107,8 +115,33 @@ class ChromaVectorStore:
                 embeddings=cast(Embeddings, vectors),
                 metadatas=cast(Metadatas, metadatas),
             )
-        # Preserve the last usable index if embedding or upsert fails.
-        stale = sorted(set(old_ids) - set(ids))
+
+    async def _index(
+        self,
+        collection: Collection,
+        ids: list[str],
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
+        *,
+        paper_id: str | None,
+    ) -> None:
+        if not len(ids) == len(documents) == len(metadatas) or len(set(ids)) != len(ids):
+            raise ValueError("Vector records must have matching lengths and unique IDs")
+        previous_ids: list[str] = []
+        if paper_id:
+            previous = await asyncio.to_thread(
+                collection.get, where={"paper_id": paper_id}, include=[]
+            )
+            previous_ids = list(previous["ids"])
+        for start in range(0, len(ids), 128):
+            end = start + 128
+            vectors = await self.embedding.embed_documents(documents[start:end])
+            if len(vectors) != len(ids[start:end]):
+                raise ValueError("Embedding count does not match documents")
+            await self._write(
+                collection, ids[start:end], documents[start:end], metadatas[start:end], vectors
+            )
+        stale = sorted(set(previous_ids) - set(ids))
         if stale:
             await asyncio.to_thread(collection.delete, ids=stale)
 
@@ -119,17 +152,19 @@ class ChromaVectorStore:
         ids: list[str],
         documents: list[str],
         metadatas: list[dict[str, Any]],
+        replace: bool = True,
     ) -> None:
         try:
-            vectors = await self.embedding.embed_documents(documents) if documents else []
             _, knowledge = await asyncio.to_thread(self.ensure_collections)
-            await self._write(knowledge, ids, documents, metadatas, vectors, paper_id=paper_id)
+            await self._index(
+                knowledge, ids, documents, metadatas, paper_id=paper_id if replace else None
+            )
+
         except Exception as exc:
             raise AppError(
                 "VECTOR_INDEX_ERROR",
                 "知识向量索引写入失败",
                 status_code=502,
-                details={"reason": str(exc)},
             ) from exc
 
     async def search_chunks(
@@ -161,7 +196,6 @@ class ChromaVectorStore:
                 "VECTOR_INDEX_ERROR",
                 "向量检索失败",
                 status_code=502,
-                details={"reason": str(exc)},
             ) from exc
 
     async def search_knowledge(
@@ -170,6 +204,8 @@ class ChromaVectorStore:
         allowed_paper_ids: Sequence[str],
         top_k: int = 8,
         knowledge_type: str | None = None,
+        *,
+        version_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if not allowed_paper_ids:
             return {
@@ -178,12 +214,16 @@ class ChromaVectorStore:
                 "metadatas": [[]],
                 "distances": [[]],
             }
+        if version_ids is not None and not version_ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
         try:
             vector = await self.embedding.embed_query(query)
             _, knowledge = await asyncio.to_thread(self.ensure_collections)
             clauses: list[dict[str, Any]] = [{"paper_id": {"$in": list(allowed_paper_ids)}}]
             if knowledge_type:
                 clauses.append({"knowledge_type": knowledge_type})
+            if version_ids is not None:
+                clauses.append({"knowledge_version_id": {"$in": version_ids}})
             where = clauses[0] if len(clauses) == 1 else {"$and": clauses}
             result = await asyncio.to_thread(
                 knowledge.query,
@@ -198,5 +238,4 @@ class ChromaVectorStore:
                 "VECTOR_INDEX_ERROR",
                 "知识向量检索失败",
                 status_code=502,
-                details={"reason": str(exc)},
             ) from exc

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -41,8 +42,8 @@ class LocalPaperStorage:
                             status_code=413,
                         )
                     digest.update(chunk)
-                    target.write(chunk)
-        except Exception:
+                    await asyncio.to_thread(target.write, chunk)
+        except BaseException:
             destination.unlink(missing_ok=True)
             raise
         finally:

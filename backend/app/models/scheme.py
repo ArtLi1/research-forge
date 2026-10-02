@@ -45,6 +45,10 @@ class CandidateVersion(UUIDPrimaryKeyMixin, Base):
 
 class AgentRun(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "agent_runs"
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("background_tasks.id", ondelete="SET NULL"), unique=True
+    )
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     project_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), index=True

@@ -6,17 +6,20 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.scheme_tools import build_default_scheme_tools
+from app.agents.context import ResearchContextService
 from app.core.errors import AppError, not_found
 from app.models import (
     AgentRun,
     BackgroundTask,
     CandidateScheme,
     CandidateVersion,
+    PaperKnowledgeCard,
     Project,
+    ProjectPaper,
     UserIdea,
 )
 from app.providers.chat import ChatModelProvider, OpenAICompatibleChatProvider, load_prompt
+from app.rag.retrieval import KnowledgeRetriever
 from app.schemas.scheme import (
     AgentTraceRead,
     CandidateConstraintCheck,
@@ -49,6 +52,19 @@ class SchemeService:
     ) -> BackgroundTask:
         if await self.session.get(Project, project_id) is None:
             raise not_found("project", project_id)
+        ready = await self.session.scalar(
+            select(PaperKnowledgeCard.id)
+            .join(ProjectPaper, ProjectPaper.paper_id == PaperKnowledgeCard.paper_id)
+            .where(
+                ProjectPaper.project_id == project_id,
+                PaperKnowledgeCard.current_version_id.is_not(None),
+            )
+            .limit(1)
+        )
+        if ready is None:
+            raise AppError(
+                "INSUFFICIENT_KNOWLEDGE", "项目尚无知识卡，请先关联论文并完成提取", status_code=409
+            )
         if request.selected_idea_ids:
             count = len(
                 list(
@@ -74,12 +90,7 @@ class SchemeService:
         )
         self.session.add(task)
         await self.session.commit()
-        await TaskService(self.session).enqueue(
-            task,
-            job_path="app.tasks.scheme_generation.generate_schemes_job",
-            job_timeout=3600,
-            extra_args=(task.payload,),
-        )
+        await TaskService(self.session).dispatch(task.id)
         return task
 
     async def list(self, project_id: uuid.UUID) -> list[CandidateSchemeSummary]:
@@ -406,12 +417,13 @@ class SchemeService:
             )
 
     async def _revision_context(self, project_id: uuid.UUID, query: str) -> dict[str, Any]:
-        tools = build_default_scheme_tools(self.session)
-        project = await tools.project_context.run(project_id)
-        scenarios = await tools.knowledge_search.run(project_id, query, "scenario", limit=10)
-        algorithms = await tools.knowledge_search.run(project_id, query, "algorithm", limit=10)
+        state = await ResearchContextService(self.session).load(project_id, query)
+        await self.session.commit()
+        retriever = KnowledgeRetriever()
+        scenarios = await retriever.search(state.scope, query, "scenario", limit=10)
+        algorithms = await retriever.search(state.scope, query, "algorithm", limit=10)
         return {
-            "project": project.model_dump(mode="json"),
+            "project": state.project_context.model_dump(mode="json"),
             "scenario_knowledge": [item.model_dump(mode="json") for item in scenarios],
             "algorithm_knowledge": [item.model_dump(mode="json") for item in algorithms],
         }

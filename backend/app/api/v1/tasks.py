@@ -7,12 +7,13 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
-from app.db.session import SessionLocal, get_session
+from app.db.session import get_session
 from app.schemas.scheme import SchemeGenerateRequest
 from app.schemas.task import TaskRead
 from app.services.papers import PaperService
 from app.services.schemes import SchemeService
-from app.services.tasks import TERMINAL_TASK_STATUSES, TaskService, task_event_name
+from app.services.tasks import TaskService
+from app.tasks.types import TERMINAL_STATUSES, task_event_name
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -25,13 +26,14 @@ async def get_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_sessi
 @router.get("/{task_id}/events")
 async def task_events(task_id: uuid.UUID, request: Request) -> StreamingResponse:
     # Validate before streaming headers are sent so missing tasks return a normal 404.
-    async with SessionLocal() as session:
+    sessions = request.app.state.database.sessions
+    async with sessions() as session:
         await TaskService(session).get(task_id)
 
     async def event_stream() -> AsyncIterator[str]:
         last_payload = ""
         while not await request.is_disconnected():
-            async with SessionLocal() as session:
+            async with sessions() as session:
                 task = await TaskService(session).get(task_id)
                 payload = TaskRead.model_validate(task).model_dump_json()
             if payload != last_payload:
@@ -40,7 +42,7 @@ async def task_events(task_id: uuid.UUID, request: Request) -> StreamingResponse
                 last_payload = payload
             else:
                 yield ": heartbeat\n\n"
-            if task.status in TERMINAL_TASK_STATUSES:
+            if task.status in TERMINAL_STATUSES:
                 break
             await asyncio.sleep(1)
 
